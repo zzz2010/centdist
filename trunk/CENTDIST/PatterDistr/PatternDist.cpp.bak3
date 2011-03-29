@@ -1,0 +1,1142 @@
+#include <cstring>
+#include "stdafx.h"
+#include "correlation.h"
+#define MAXSEQLEN 10000
+//#define NORMALIZE
+bool getThresh=false;
+	float cutoff=0;
+vector<unsigned long> rmPoslist;
+
+/***********************************************/
+PARAM *read_parameters (int nargs, char **argv)
+/***********************************************/
+{
+PARAM *p;
+int iarg=1, score=0, i;
+static char* syntax = "patterDistr -i inputPosFile  [-o outputDIR -findThresh  -ratio minSupportRatio -pdt specifiedThresh -rm rmfile -rmlen len -rt rmThresh -K order]";
+
+
+//if(nargs < 3){ printf("%s\n",syntax); exit(0); }
+p = new param_st();//(PARAM*)calloc(1,sizeof(PARAM));
+p->seedlength= 10;
+p->min_supp_ratio=0.05;
+p->FDRthresh=1.e-7;
+p->olThresh=0;
+p->pdThresh=0.18;
+p->outputDIR=string(".");
+p->max_motif_length=26;
+p->N_motif=3;
+p->resolution=100;
+p->startwSize=100;
+p->PeakRange=4000;
+p->weightFile="";
+
+while(iarg < nargs){
+	if(!strcmp(argv[iarg],"-i") && iarg < nargs-1){ p->inputFile=argv[++iarg]; }
+	else if(!strcmp(argv[iarg],"-o") && iarg < nargs-1) p->outputDIR=argv[++iarg];
+	else if(!strcmp(argv[iarg],"-findThresh") ) getThresh=true;
+	else if(!strcmp(argv[iarg],"-rm") && iarg < nargs-1) p->weightFile=argv[++iarg];
+	else if(!strcmp(argv[iarg],"-rt") && iarg < nargs-1) sscanf(argv[++iarg],"%f",&p->olThresh);
+	else if(!strcmp(argv[iarg],"-pdt") && iarg < nargs-1) sscanf(argv[++iarg],"%f",&cutoff);
+	else if(!strcmp(argv[iarg],"-ratio") && iarg < nargs-1) sscanf(argv[++iarg],"%f",&p->min_supp_ratio);
+	else if(!strcmp(argv[iarg],"-FDR") && iarg < nargs-1) sscanf(argv[++iarg],"%f",&p->FDRthresh);
+	else if(!strcmp(argv[iarg],"-maxlen") && iarg < nargs-1) sscanf(argv[++iarg],"%d",&p->max_motif_length);
+	else if(!strcmp(argv[iarg],"-K") && iarg < nargs-1) sscanf(argv[++iarg],"%d",&p->N_motif);
+	else if(!strcmp(argv[iarg],"-rmlen") && iarg < nargs-1) sscanf(argv[++iarg],"%d",&p->seedlength);
+	else if(!strcmp(argv[iarg],"-mbr") && iarg < nargs-1) sscanf(argv[++iarg],"%d",&p->startwSize);
+	else if(!strcmp(argv[iarg],"-rs") && iarg < nargs-1) sscanf(argv[++iarg],"%d",&p->resolution);
+	else if(!strcmp(argv[iarg],"-pr") && iarg < nargs-1) sscanf(argv[++iarg],"%d",&p->PeakRange);
+	else{
+		//printf("ERROR: Wrong option %s\n", argv[iarg]);
+		exit(0); 
+	}
+	++iarg;
+}
+
+if(!p->inputFile[0]){ printf("ERROR: %s\n",syntax); exit(0); }
+//
+//
+//if(p->N_motif<1){ printf("WARNING: Wrong number of output motifs. Using default N=20\n"); p->N_motif=20; }
+//if(p->min_supp_ratio >1){ printf("WARNING: Minimum ratio should be <1. Using default=0.05\n"); p->min_supp_ratio=0.05; }
+return(p);
+}
+
+
+int  split_string (char *string, char *items[], int num)
+/***********************************************/
+{
+char *ch;
+int i=0;
+
+ch = strchr(string,'\n');
+if(ch) *ch = '\0';
+ch = string;
+while(1){
+	items[i] = ch;
+	ch = strchr(ch,'\t');
+	if(ch) *ch = '\0';
+	else break;
+	if(i>=num-1) break;
+	ch++;
+	i++;
+}
+return(i+1);
+}
+
+void LoadrmPoslist(PARAM * setting)
+{
+
+	FILE* fp = fopen(setting->weightFile.c_str(),"r");
+	
+	char buffer[300];
+	char *items[10];
+
+	int SEQLEN=0;
+	int maxSeqNum=0;
+	while(fgets(buffer,300,fp)){
+		int seqid=0;
+		int pos=0;
+
+		int n = split_string(&buffer[0],items,10);
+		if(n<2)
+			continue;
+		sscanf(items[0],"%d",&seqid);
+		sscanf(items[1],"%d",&pos);
+		//if(getThresh)
+		{
+			float score;
+			sscanf(items[2],"%f",&score);
+			if(score<setting->olThresh)
+				continue;
+		}
+		if(maxSeqNum<seqid)
+			maxSeqNum=seqid;
+		if(pos>SEQLEN)
+			SEQLEN=pos;
+		rmPoslist.push_back((unsigned long)pos+seqid*MAXSEQLEN);
+	}
+	sort(rmPoslist.begin(),rmPoslist.end());
+	//cout<<rmPoslist[rmPoslist.size()-1]<<endl;
+		fclose(fp);
+}
+
+bool testInside(vector<unsigned long>& v, int extendlen,unsigned long searchVal,PARAM * setting)
+{
+	vector<unsigned long>::iterator low,up;
+	low=lower_bound (v.begin(), v.end(), searchVal); //    
+	
+	if(low==v.end()||low!=v.begin()&&(unsigned long)*low!=searchVal)
+		low--;
+  up= upper_bound (v.begin(), v.end(), searchVal); //  
+		if(up==v.end())
+		up--;
+		if((searchVal-(unsigned long)*low)<setting->seedlength)
+			  return true;
+		  if(((unsigned long)*up-searchVal)<setting->seedlength)
+			  return true;
+  return false;
+}
+
+void CenterDistribtionScore(PARAM * setting)
+{
+	FILE* fp = fopen(setting->inputFile.c_str(),"r");
+	const double log10=log(10.0);
+	char buffer[300];
+	char *items[10];
+	vector<float> scorelist;
+	vector<int> positionlist;
+	set<float> sortedThresh;
+	vector<int> sameSeqPos;
+	int SEQLEN=0;
+	int maxSeqNum=0;
+	int lastpos=-1000;
+	int lastseq=-1;
+	double sumSameSeq=0;
+
+	vector<float> problist;
+	while(fgets(buffer,300,fp)){
+		int seqid=0;
+		int pos=0;
+
+		int n = split_string(&buffer[0],items,10);
+		if(n<2)
+			continue;
+		sscanf(items[0],"%d",&seqid);
+		sscanf(items[1],"%d",&pos);
+		//if(getThresh)
+		if(maxSeqNum<seqid)
+			maxSeqNum=seqid;
+		
+		if(rmPoslist.size()>0)
+		{
+			bool rmflag=testInside(rmPoslist,setting->seedlength,(unsigned long)pos+seqid*MAXSEQLEN,setting);
+			if(rmflag)
+				continue;
+		}
+		//filter repeat
+		if(lastseq!=seqid)
+		{
+			lastseq=seqid;
+			lastpos=-1000;
+#ifdef NORMALIZE
+			for(int i=0;i<sameSeqPos.size();i++)
+			{
+				int p=sameSeqPos[i];
+				problist[p]=problist[p]/sumSameSeq;
+			}
+
+			sameSeqPos.clear();
+			sumSameSeq=0;
+#endif
+		}
+		/***modified***/
+		//else if(abs(lastpos-pos)<setting->resolution/2)
+		//{
+		//	//cout<<"a";
+		//	//lastpos=pos;
+		//	continue;
+		//}
+		//else
+		//	lastpos=pos;
+
+		{
+			float score;
+			sscanf(items[2],"%f",&score);
+			scorelist.push_back(score);
+			sortedThresh.insert(score);
+#ifdef NORMALIZE
+			sameSeqPos.push_back(scorelist.size()-1);
+			double temp=exp(score*log10);
+			sumSameSeq+=temp;
+			problist.push_back(temp);
+#endif
+		}
+
+		if(pos>SEQLEN)
+			SEQLEN=pos;
+		positionlist.push_back(pos);
+	}
+		fclose(fp);
+		if(positionlist.size()<setting->min_supp_ratio*maxSeqNum)
+		{
+			cout<<setting->inputFile<<"\t"<<0<<"\t"<<0<<"\t"<<0<<"\t"<<0<<"\t"<<0<<endl; 
+			return;
+		}
+SEQLEN=ceil(SEQLEN/20.0)*20;
+int BINNUMBER= ceil((double)SEQLEN/setting->resolution);
+int BINSIZE2=ceil((double)SEQLEN/2/(BINNUMBER));
+int center=SEQLEN/2;
+	double* CDHist=new double[BINNUMBER];
+	
+double *CDDiff=new double[BINNUMBER-1]; 
+double *CDDiff2=new double[BINNUMBER-2]; 
+double bestscore=-1000000000000;
+int bestwin=1;
+double bestZ1score=-1000000000000;
+double bestZ2score=-1000000000000;
+double bestCutoff=0;
+bool up=true;
+double lastbestscore=-1000000000000;
+double sumNorm=0;
+				double CDScore=-1000000000000;
+				int bestbgcnt,bestcdcnt,bestwindowId;
+//ap::real_1d_array orderNum;
+//orderNum.setbounds(0,BINNUMBER-1);
+//	for(int i=0;i<BINNUMBER;i++)
+//		orderNum(i)=i;
+
+lastpos=10000;
+	int step=sortedThresh.size();
+		set<float>::iterator ITER=sortedThresh.begin();
+		do
+		{
+			for(int i=0;i<BINNUMBER;i++)
+		CDHist[i]=0;
+		
+			if(getThresh)
+				cutoff=*ITER;
+			int count=0;
+			int coverSeq=0;
+			for(int i=0;i<positionlist.size();i++)
+			{
+				int pos=positionlist[i];
+				if(scorelist[i]>=cutoff){
+					int tt=abs(pos-center);
+						tt=tt/BINSIZE2;
+						if(tt>=BINNUMBER)
+						tt=BINNUMBER-1;
+						double step=1;
+#ifdef NORMALIZE
+						step=scorelist[i];//exp(scorelist[i]*log10);
+			
+				sumNorm+=step;
+				count++;
+				if(lastpos>pos)
+				{
+					coverSeq++;	
+				}
+
+				lastpos=pos;
+#endif
+
+				CDHist[tt]+=step;
+				}
+			}
+#ifdef NORMALIZE
+			//if(count>maxSeqNum)
+			//sumNorm=sumNorm/(maxSeqNum+1);
+			//else
+				//sumNorm=sumNorm/(positionlist.size());
+			sumNorm=sumNorm/(count);
+			//double s=0;
+			for(int j=0;j<BINNUMBER;j++)
+			{
+				CDHist[j]/=sumNorm;
+				//cout<<CDHist[j]<<endl;
+				//s+=CDHist[j];
+			}
+#endif
+/**modified**/
+			CDHist[BINNUMBER-1]=CDHist[BINNUMBER-2];
+
+			//ap::real_1d_array CDrank;
+			//CDrank.setcontent(0,BINNUMBER-1,CDHist);
+			//double rscore=spearmanrankcorrelation(orderNum,CDrank,BINNUMBER);
+		double ssr=0;
+			double minbin=1000;
+			for(int j=0;j<BINNUMBER-1;j++)
+			{
+				/**modified**/
+				double temp=fabs(CDHist[j]-CDHist[j+1]);
+				if(temp<0)
+					temp=0;
+				CDDiff[j]=temp;
+				ssr+=CDDiff[j];
+				if(CDHist[j+1]<minbin)
+					minbin=CDHist[j+1];
+			}
+			if(BINNUMBER<10)
+					break;
+			if(minbin<10)
+			{
+				setting->resolution=setting->resolution*2;
+				BINNUMBER= ceil((double)SEQLEN/setting->resolution);
+				BINSIZE2=ceil((double)SEQLEN/2/(BINNUMBER));
+
+				continue;
+			}
+			
+	/**********use absolute 1-order************/
+			//for(int j=0;j<BINNUMBER-2;j++)
+			//{
+			//	CDDiff2[j]=fabs(CDDiff[j+1]-CDDiff[j]);
+			//	ssr+=CDDiff2[j];
+			//}
+	/**********use absolute 1-order************/
+
+/**********use 0-order************/
+			for(int j=0;j<BINNUMBER-2;j++)
+			{
+				/**modified**/
+				double temp=fabs(CDHist[j]-2*CDHist[j+1]+CDHist[j+2]);
+				if(temp<0)
+					temp=0;
+				CDDiff2[j]=temp;
+				ssr+=CDDiff2[j];
+			}
+/**********use 0-order************/
+		
+				for(int i=0;i<BINNUMBER/2;i++)
+				{
+					double cdcnter=0;
+					double bgcnter=0;
+					double cddiff=0;
+						double cddiff2=0;
+					double bgdiff=0;
+						double bgdiff2=0;
+					double score=0;
+					for(int j=0;j<i+1;j++)
+					{
+						cdcnter+=CDHist[j];
+						cddiff+=CDDiff[j];
+						cddiff2+=CDDiff2[j];
+					}
+					for(int j=i+1;j<BINNUMBER;j++)
+					{
+						bgcnter+=CDHist[j];
+						if(j<BINNUMBER-1)
+						bgdiff+=CDDiff[j];
+						if(j<BINNUMBER-2)
+						bgdiff2+=CDDiff2[j];
+					}
+
+				  
+				double ratio=(double)(i+1)/BINNUMBER;
+				double ratio2=(double)(i+1)/(BINNUMBER-1);
+				double ratio3=(double)(i+1)/(BINNUMBER-2);
+				double n=bgcnter+cdcnter;
+				double bias1=fabs(cdcnter/(i+1)-bgcnter/(BINNUMBER-i-1));
+				double bias2=fabs(cddiff/(i+1)-bgdiff/(BINNUMBER-i-2));
+				//cddiff-=bias1/2;
+				//cddiff2-=bias2/2;
+				double n2=bgdiff+cddiff;
+				double n3=bgdiff2+cddiff2;
+				double Z0=(cdcnter-n*ratio)/sqrt(n*ratio*(1-ratio));
+				double Z1=(cddiff-n2*ratio2)/sqrt(n2*ratio2*(1-ratio2));
+				double Z2=(cddiff2-n3*ratio3)/sqrt(n3*ratio3*(1-ratio3));
+/**modified**/
+				if(Z1>2*Z0||i>3)
+				{
+					Z1=0;
+				//if(Z2>2*Z0||Z2>2*Z1)
+					Z2=0;
+				}
+/**modified**/
+
+				score=Z0; //+ssr*ssr
+				//if(setting->N_motif==2)
+				//	score=Z0+Z1;
+				//if(setting->N_motif==3)
+				//	score=Z0+Z1+Z2; 
+
+					if(score>=bestscore&&cdcnter>50)
+					{
+						bestwindowId=i;				
+						bestwin=setting->resolution;
+						//cout<<(bestwindowId+1)*bestwin<<"\t"<<Z0<<"\t"<<Z1<<"\t"<<Z2<<endl;
+						bestscore=score;
+						CDScore=Z0;
+						bestZ1score=Z1;
+						bestZ2score=Z2;
+						bestbgcnt=bgcnter;
+						bestcdcnt=cdcnter;
+						
+					}
+			
+				
+				}
+				if(bestscore>lastbestscore)
+				{
+					lastbestscore=bestscore;
+					bestCutoff=cutoff;	
+
+				}
+				//else
+				//	up=!up;
+				//if(up)
+				//{
+				//		step=step/2;
+				//		for(int k=0;k<step;k++)
+				//			ITER++;
+				//}
+				//else
+				//{
+				//	step=step/2;
+				//		for(int k=0;k<step;k++)
+				//			ITER--;
+				//}
+				
+
+				if(!getThresh)
+					break;
+				ITER++;
+				step--;
+		}while(step>1);
+		if(setting->N_motif==2)
+			bestscore+=bestZ1score;
+		if(setting->N_motif==3)
+			bestscore+=bestZ1score+bestZ2score;
+			int window=(bestwindowId+1)*bestwin;
+			
+			cout<<setting->inputFile<<"\t"<<bestscore/(setting->N_motif*setting->N_motif)<<"\t"<<window<<"\t"<<bestCutoff<<"\t"<<CDScore<<"\t"<<bestZ1score<<endl; 
+}
+
+void UDSmoothCenterDistribtionScore(PARAM * setting)
+{
+	FILE* fp = fopen(setting->inputFile.c_str(),"r");
+	const double log10=log(10.0);
+	char buffer[300];
+	char *items[10];
+	vector<float> scorelist;
+	vector<int> positionlist;
+	set<float> sortedThresh;
+	vector<int> sameSeqPos;
+	int SEQLEN=0;
+	int maxSeqNum=0;
+	int lastpos=-1000;
+	int lastseq=-1;
+	double sumSameSeq=0;
+
+/***debug**/
+	int slidewin=(int)200/setting->resolution;//setting->N_motif;
+//setting->resolution=20;
+
+	vector<float> problist;
+	while(fgets(buffer,300,fp)){
+		int seqid=0;
+		int pos=0;
+
+		int n = split_string(&buffer[0],items,10);
+		if(n<2)
+			continue;
+		sscanf(items[0],"%d",&seqid);
+		sscanf(items[1],"%d",&pos);
+		//if(getThresh)
+		if(maxSeqNum<seqid)
+			maxSeqNum=seqid;
+		
+		if(rmPoslist.size()>0)
+		{
+			bool rmflag=testInside(rmPoslist,setting->seedlength,(unsigned long)pos+seqid*MAXSEQLEN,setting);
+			if(rmflag)
+				continue;
+		}
+		//filter repeat
+		if(lastseq!=seqid)
+		{
+			lastseq=seqid;
+			lastpos=-1000;
+#ifdef NORMALIZE
+			for(int i=0;i<sameSeqPos.size();i++)
+			{
+				int p=sameSeqPos[i];
+				problist[p]=problist[p]/sumSameSeq;
+			}
+
+			sameSeqPos.clear();
+			sumSameSeq=0;
+#endif
+		}
+
+		{
+			float score;
+			sscanf(items[2],"%f",&score);
+			scorelist.push_back(score);
+			sortedThresh.insert(score);
+#ifdef NORMALIZE
+			sameSeqPos.push_back(scorelist.size()-1);
+			double temp=exp(score*log10);
+			sumSameSeq+=temp;
+			problist.push_back(temp);
+#endif
+		}
+
+		if(pos>SEQLEN)
+			SEQLEN=pos;
+		positionlist.push_back(pos);
+	}
+		fclose(fp);
+		if(positionlist.size()<setting->min_supp_ratio*maxSeqNum)
+		{
+			cout<<setting->inputFile<<"\t"<<0<<"\t"<<0<<"\t"<<0<<"\t"<<0<<"\t"<<0<<endl; 
+			return;
+		}
+SEQLEN=ceil(SEQLEN/20.0)*20;
+int BINNUMBER= ceil((double)SEQLEN/setting->resolution);
+int BINSIZE2=ceil((double)SEQLEN/2/(BINNUMBER));
+int center=SEQLEN/2;
+	double* CDHist=new double[BINNUMBER];
+	double* SmoothCDHist=new double[BINNUMBER];
+double *CDDiff=new double[BINNUMBER-1]; 
+double *CDDiff2=new double[BINNUMBER-2]; 
+double bestscore=-1000000000000;
+int bestwin=1;
+double bestZ1score=-1000000000000;
+double bestZ2score=-1000000000000;
+double bestCutoff=0;
+bool up=true;
+double lastbestscore=-1000000000000;
+double sumNorm=0;
+				double CDScore=-1000000000000;
+				int bestbgcnt,bestcdcnt,bestwindowId;
+
+
+lastpos=10000;
+	int step=sortedThresh.size();
+		set<float>::iterator ITER=sortedThresh.begin();
+		do
+		{
+			for(int i=0;i<BINNUMBER;i++)
+			{
+				CDHist[i]=0;
+				SmoothCDHist[i]=0;
+			}
+			if(getThresh)
+				cutoff=*ITER;
+			int count=0;
+			int coverSeq=0;
+			for(int i=0;i<positionlist.size();i++)
+			{
+				int pos=positionlist[i];
+				if(scorelist[i]>=cutoff){
+					int tt=abs(pos-center);
+						tt=tt/BINSIZE2;
+						if(tt>=BINNUMBER)
+						tt=BINNUMBER-1;
+						double step=1;
+#ifdef NORMALIZE
+						step=scorelist[i];//exp(scorelist[i]*log10);
+			
+				sumNorm+=step;
+				count++;
+				if(lastpos>pos)
+				{
+					coverSeq++;	
+				}
+
+				lastpos=pos;
+#endif
+
+				CDHist[tt]+=step;
+				}
+			}
+#ifdef NORMALIZE
+
+			sumNorm=sumNorm/(count);
+			//double s=0;
+			for(int j=0;j<BINNUMBER;j++)
+			{
+				CDHist[j]/=sumNorm;
+
+			}
+#endif
+/**modified**/
+			
+			CDHist[BINNUMBER-1]=CDHist[BINNUMBER-2];
+for(int j=0;j<BINNUMBER-slidewin;j++)
+{
+	for(int kk=j;kk<j+slidewin;kk++)
+		SmoothCDHist[j]+=CDHist[kk];
+		
+	SmoothCDHist[j]=SmoothCDHist[j]/slidewin;
+	
+}
+for(int rr=BINNUMBER-slidewin;rr<BINNUMBER;rr++)
+{
+	SmoothCDHist[rr]=SmoothCDHist[BINNUMBER-slidewin-1];
+}
+
+		double ssr=0;
+			double minbin=1000;
+			for(int j=0;j<BINNUMBER-1;j++)
+			{
+				/**modified**/
+				double temp=(SmoothCDHist[j]-SmoothCDHist[j+1]);
+				//cout<<temp<<endl;
+				if(temp>0)
+				CDDiff[j]=1;
+				else
+				CDDiff[j]=0;
+				ssr+=CDDiff[j];
+				if(CDHist[j+1]<minbin)
+					minbin=CDHist[j+1];
+			}
+			if(BINNUMBER<10)
+					break;
+			if(minbin<10)
+			{
+				setting->resolution=setting->resolution*2;
+				BINNUMBER= ceil((double)SEQLEN/setting->resolution);
+				BINSIZE2=ceil((double)SEQLEN/2/(BINNUMBER));
+
+				continue;
+			}
+			
+	/**********use absolute 1-order************/
+			//for(int j=0;j<BINNUMBER-2;j++)
+			//{
+			//	CDDiff2[j]=fabs(CDDiff[j+1]-CDDiff[j]);
+			//	ssr+=CDDiff2[j];
+			//}
+	/**********use absolute 1-order************/
+
+/**********use 0-order************/
+			for(int j=0;j<BINNUMBER-2;j++)
+			{
+				/**modified**/
+				double temp=(SmoothCDHist[j]-2*SmoothCDHist[j+1]+SmoothCDHist[j+2]);
+				if(temp>0)
+				CDDiff2[j]=1;
+				else
+				CDDiff2[j]=0;
+				ssr+=CDDiff2[j];
+			}
+/**********use 0-order************/
+		
+				for(int i=0;i<BINNUMBER/2;i++)
+				{
+					double cdcnter=0;
+					double bgcnter=0;
+					double cddiff=0;
+						double cddiff2=0;
+					double bgdiff=0;
+						double bgdiff2=0;
+					double score=0;
+					for(int j=0;j<i+1;j++)
+					{
+						cdcnter+=CDHist[j];
+						cddiff+=CDDiff[j];
+						cddiff2+=CDDiff2[j];
+					}
+					for(int j=i+1;j<BINNUMBER;j++)
+					{
+						bgcnter+=CDHist[j];
+						if(j<BINNUMBER-1)
+						bgdiff+=CDDiff[j];
+						if(j<BINNUMBER-2)
+						bgdiff2+=CDDiff2[j];
+					}
+
+				  
+				double ratio=(double)(i+1)/BINNUMBER;
+				double ratio2=(double)(i+1)/(BINNUMBER-1);
+				double ratio3=(double)(i+1)/(BINNUMBER-2);
+				double n=bgcnter+cdcnter;
+				double bias1=fabs(cdcnter/(i+1)-bgcnter/(BINNUMBER-i-1));
+				double bias2=fabs(cddiff/(i+1)-bgdiff/(BINNUMBER-i-2));
+				//cddiff-=bias1/2;
+				//cddiff2-=bias2/2;
+				double n2=bgdiff+cddiff;
+				double n3=bgdiff2+cddiff2;
+				double Z0=(cdcnter-n*ratio)/sqrt(n*ratio*(1-ratio));
+				double Z1=(cddiff-n2*ratio2)/sqrt(n2*ratio2*(1-ratio2));
+				double Z2=(cddiff2-n3*ratio3)/sqrt(n3*ratio3*(1-ratio3));
+/**modified**/
+				if(Z0<10)
+				{
+					Z1=0;
+				//if(Z2>2*Z0||Z2>2*Z1)
+					Z2=0;
+				}
+/**modified**/
+
+				score=Z0; //+ssr*ssr
+				//if(setting->N_motif==2)
+				//	score=Z0+Z1;
+				//if(setting->N_motif==3)
+				//	score=Z0+Z1+Z2; 
+
+					if(score>=bestscore&&cdcnter>50)
+					{
+						bestwindowId=i;				
+						bestwin=setting->resolution;
+						//cout<<(bestwindowId+1)*bestwin<<"\t"<<Z0<<"\t"<<Z1<<"\t"<<Z2<<endl;
+						bestscore=score;
+						CDScore=Z0;
+						bestZ1score=Z1;
+						bestZ2score=Z2;
+						bestbgcnt=bgcnter;
+						bestcdcnt=cdcnter;
+						
+					}
+			
+				
+				}
+				if(bestscore>lastbestscore)
+				{
+					lastbestscore=bestscore;
+					bestCutoff=cutoff;	
+
+				}
+						
+
+				if(!getThresh)
+					break;
+				ITER++;
+				step--;
+		}while(step>1);
+		if(setting->N_motif==2)
+			bestscore+=bestZ1score;
+		if(setting->N_motif==3)
+			bestscore+=bestZ1score+bestZ2score;
+			int window=(bestwindowId+1)*bestwin;
+			
+			cout<<setting->inputFile<<"\t"<<bestscore/(setting->N_motif*setting->N_motif)<<"\t"<<window<<"\t"<<bestCutoff<<"\t"<<CDScore<<"\t"<<bestZ1score<<endl; 
+}
+
+void SmoothCenterDistribtionScore(PARAM * setting)
+{
+	FILE* fp = fopen(setting->inputFile.c_str(),"r");
+	const double log10=log(10.0);
+	char buffer[300];
+	char *items[10];
+	vector<float> scorelist;
+	vector<int> positionlist;
+	set<float> sortedThresh;
+	vector<int> sameSeqPos;
+	int SEQLEN=0;
+	int maxSeqNum=0;
+	int lastpos=-1000;
+	int lastseq=-1;
+	double sumSameSeq=0;
+
+/***debug**/
+	int slidewin=(int)200/setting->resolution;//setting->N_motif;
+//setting->resolution=20;
+
+	vector<float> problist;
+	while(fgets(buffer,300,fp)){
+		int seqid=0;
+		int pos=0;
+
+		int n = split_string(&buffer[0],items,10);
+		if(n<2)
+			continue;
+		sscanf(items[0],"%d",&seqid);
+		sscanf(items[1],"%d",&pos);
+		//if(getThresh)
+		if(maxSeqNum<seqid)
+			maxSeqNum=seqid;
+		
+		if(rmPoslist.size()>0)
+		{
+			bool rmflag=testInside(rmPoslist,setting->seedlength,(unsigned long)pos+seqid*MAXSEQLEN,setting);
+			if(rmflag)
+				continue;
+		}
+		//filter repeat
+		if(lastseq!=seqid)
+		{
+			lastseq=seqid;
+			lastpos=-1000;
+#ifdef NORMALIZE
+			for(int i=0;i<sameSeqPos.size();i++)
+			{
+				int p=sameSeqPos[i];
+				problist[p]=problist[p]/sumSameSeq;
+			}
+
+			sameSeqPos.clear();
+			sumSameSeq=0;
+#endif
+		}
+
+		{
+			float score;
+			sscanf(items[2],"%f",&score);
+			scorelist.push_back(score);
+			sortedThresh.insert(score);
+#ifdef NORMALIZE
+			sameSeqPos.push_back(scorelist.size()-1);
+			double temp=exp(score*log10);
+			sumSameSeq+=temp;
+			problist.push_back(temp);
+#endif
+		}
+
+		if(pos>SEQLEN)
+			SEQLEN=pos;
+		positionlist.push_back(pos);
+	}
+		fclose(fp);
+		if(positionlist.size()<setting->min_supp_ratio*maxSeqNum)
+		{
+			cout<<setting->inputFile<<"\t"<<0<<"\t"<<0<<"\t"<<0<<"\t"<<0<<"\t"<<0<<endl; 
+			return;
+		}
+SEQLEN=ceil(SEQLEN/20.0)*20;
+int BINNUMBER= ceil((double)SEQLEN/setting->resolution);
+int BINSIZE2=ceil((double)SEQLEN/2/(BINNUMBER));
+int center=SEQLEN/2;
+	double* CDHist=new double[BINNUMBER];
+	double* SmoothCDHist=new double[BINNUMBER];
+double *CDDiff=new double[BINNUMBER-1]; 
+double *CDDiff2=new double[BINNUMBER-2]; 
+double bestscore=-1000000000000;
+int bestwin=1;
+double bestZ1score=-1000000000000;
+double bestZ2score=-1000000000000;
+double bestCutoff=0;
+bool up=true;
+double lastbestscore=-1000000000000;
+double sumNorm=0;
+				double CDScore=-1000000000000;
+				int bestbgcnt,bestcdcnt,bestwindowId;
+
+
+lastpos=10000;
+	int step=sortedThresh.size();
+		set<float>::iterator ITER=sortedThresh.begin();
+		do
+		{
+			for(int i=0;i<BINNUMBER;i++)
+			{
+				CDHist[i]=0;
+				SmoothCDHist[i]=0;
+			}
+			if(getThresh)
+				cutoff=*ITER;
+			int count=0;
+			int coverSeq=0;
+			for(int i=0;i<positionlist.size();i++)
+			{
+				int pos=positionlist[i];
+				if(scorelist[i]>=cutoff){
+					int tt=abs(pos-center);
+						tt=tt/BINSIZE2;
+						if(tt>=BINNUMBER)
+						tt=BINNUMBER-1;
+						double step=1;
+#ifdef NORMALIZE
+						step=scorelist[i];//exp(scorelist[i]*log10);
+			
+				sumNorm+=step;
+				count++;
+				if(lastpos>pos)
+				{
+					coverSeq++;	
+				}
+
+				lastpos=pos;
+#endif
+
+				CDHist[tt]+=step;
+				}
+			}
+#ifdef NORMALIZE
+
+			sumNorm=sumNorm/(count);
+			//double s=0;
+			for(int j=0;j<BINNUMBER;j++)
+			{
+				CDHist[j]/=sumNorm;
+
+			}
+#endif
+/**modified**/
+			
+			CDHist[BINNUMBER-1]=CDHist[BINNUMBER-2];
+for(int j=0;j<BINNUMBER-slidewin;j++)
+{
+	for(int kk=j;kk<j+slidewin;kk++)
+		SmoothCDHist[j]+=CDHist[kk];
+		
+	SmoothCDHist[j]=SmoothCDHist[j]/slidewin;
+	//SmoothCDHist[j]=CDHist[j];
+	
+}
+for(int rr=BINNUMBER-slidewin;rr<BINNUMBER;rr++)
+{
+	SmoothCDHist[rr]=SmoothCDHist[BINNUMBER-slidewin-1];
+}
+
+		double ssr=0;
+			double minbin=1000;
+			for(int j=0;j<BINNUMBER-1;j++)
+			{
+				/**modified**/
+				double temp=fabs(SmoothCDHist[j]-SmoothCDHist[j+1]);
+				//cout<<temp<<endl;
+				if(temp<0)
+					temp=0;
+				CDDiff[j]=temp;
+				ssr+=CDDiff[j];
+				if(CDHist[j+1]<minbin)
+					minbin=CDHist[j+1];
+			}
+			if(BINNUMBER<10)
+					break;
+			if(minbin<10)
+			{
+				setting->resolution=setting->resolution*2;
+				BINNUMBER= ceil((double)SEQLEN/setting->resolution);
+				BINSIZE2=ceil((double)SEQLEN/2/(BINNUMBER));
+
+				continue;
+			}
+			
+	/**********use absolute 1-order************/
+			//for(int j=0;j<BINNUMBER-2;j++)
+			//{
+			//	CDDiff2[j]=fabs(CDDiff[j+1]-CDDiff[j]);
+			//	ssr+=CDDiff2[j];
+			//}
+	/**********use absolute 1-order************/
+
+/**********use 0-order************/
+			for(int j=0;j<BINNUMBER-2;j++)
+			{
+				/**modified**/
+				double temp=fabs(SmoothCDHist[j]-2*SmoothCDHist[j+1]+SmoothCDHist[j+2]);
+				if(temp<0)
+					temp=0;
+				CDDiff2[j]=temp;
+				ssr+=CDDiff2[j];
+			}
+/**********use 0-order************/
+		
+				for(int i=0;i<BINNUMBER/2;i++)
+				{
+					double cdcnter=0;
+					double bgcnter=0;
+					double cddiff=0;
+						double cddiff2=0;
+					double bgdiff=0;
+						double bgdiff2=0;
+					double score=0;
+					for(int j=0;j<i+1;j++)
+					{
+						cdcnter+=CDHist[j];
+						cddiff+=CDDiff[j];
+						cddiff2+=CDDiff2[j];
+					}
+					for(int j=i+1;j<BINNUMBER;j++)
+					{
+						bgcnter+=CDHist[j];
+						if(j<BINNUMBER-1)
+						bgdiff+=CDDiff[j];
+						if(j<BINNUMBER-2)
+						bgdiff2+=CDDiff2[j];
+					}
+
+				  
+				double ratio=(double)(i+1)/BINNUMBER;
+				double ratio2=(double)(i+1)/(BINNUMBER-1);
+				double ratio3=(double)(i+1)/(BINNUMBER-2);
+				double n=bgcnter+cdcnter;
+				double bias1=fabs(cdcnter/(i+1)-bgcnter/(BINNUMBER-i-1));
+				double bias2=fabs(cddiff/(i+1)-bgdiff/(BINNUMBER-i-2));
+				//cddiff-=bias1/2;
+				//cddiff2-=bias2/2;
+				double n2=bgdiff+cddiff;
+				double n3=bgdiff2+cddiff2;
+				double Z0=(cdcnter-n*ratio)/sqrt(n*ratio*(1-ratio));
+				double Z1=(cddiff-n2*ratio2)/sqrt(n2*ratio2*(1-ratio2));
+				double Z2=(cddiff2-n3*ratio3)/sqrt(n3*ratio3*(1-ratio3));
+/**modified**/
+				if(Z0<10)
+				{
+					Z1=0;
+				//if(Z2>2*Z0||Z2>2*Z1)
+					Z2=0;
+				}
+/**modified**/
+
+				score=Z0; //+ssr*ssr
+				//if(setting->N_motif==2)
+				//	score=Z0+Z1;
+				//if(setting->N_motif==3)
+				//	score=Z0+Z1+Z2; 
+
+					if(score>=bestscore&&cdcnter>50)
+					{
+						bestwindowId=i;				
+						bestwin=setting->resolution;
+						//cout<<(bestwindowId+1)*bestwin<<"\t"<<Z0<<"\t"<<Z1<<"\t"<<Z2<<endl;
+						bestscore=score;
+						CDScore=Z0;
+						bestZ1score=Z1;
+						bestZ2score=Z2;
+						bestbgcnt=bgcnter;
+						bestcdcnt=cdcnter;
+						
+					}
+			
+				
+				}
+				if(bestscore>lastbestscore)
+				{
+					lastbestscore=bestscore;
+					bestCutoff=cutoff;	
+
+				}
+						
+
+				if(!getThresh)
+					break;
+				ITER++;
+				step--;
+		}while(step>1);
+		if(setting->N_motif==2)
+			bestscore+=bestZ1score;
+		if(setting->N_motif==3)
+			bestscore+=bestZ1score+bestZ2score;
+			int window=(bestwindowId+1)*bestwin;
+			
+			cout<<setting->inputFile<<"\t"<<bestscore/(setting->N_motif*setting->N_motif)<<"\t"<<window<<"\t"<<bestCutoff<<"\t"<<CDScore<<"\t"<<bestZ1score<<endl; 
+}
+
+void SimplePeakEnrichmentScore(PARAM * setting)
+{
+	FILE* fp = fopen(setting->inputFile.c_str(),"r");
+	int binNum=(setting->PeakRange+setting->resolution-1)/setting->resolution;
+	int* CDHist=new int[binNum];
+	int maxSeqNum=0;
+	for(int i=0;i<binNum;i++)
+		CDHist[i]=0;
+	char buffer[30];
+	char *items[10];
+	int center=setting->PeakRange/2;
+	while(fgets(buffer,30,fp)){
+		int seqid=0;
+		int pos=0;
+		int n = split_string(&buffer[0],items,10);
+		if(n<2)
+			continue;
+		sscanf(items[0],"%d",&seqid);
+		sscanf(items[1],"%d",&pos);
+		if(maxSeqNum<seqid)
+			maxSeqNum=seqid;
+		CDHist[abs(pos-center)/(setting->resolution/2)]++;
+	}
+		fclose(fp);
+		int windowsize=100;
+		double CDScore;
+		int bestbgcnt,bestcdcnt,bestwindowId;
+		double bestscore=0;
+	    for(int i=0;i<binNum/5;i++)
+		{
+			int j=0;
+			double cdcnter=0;
+			double bgcnter=0;
+			
+			double score=0;
+			for(j=0;j<i+1;j++)
+				cdcnter+=CDHist[j];
+			for(j=i+1;j<binNum;j++)
+				bgcnter+=CDHist[j];
+			//only average on bg
+			double avgvalue=(double)(bgcnter/(binNum-i-1));
+			double ssr=0;
+			for(j=i+1;j<binNum;j++)
+					ssr+=(CDHist[j]-avgvalue)*(CDHist[j]-avgvalue);
+			ssr=sqrt( (double)(ssr/(binNum-i-1)));
+			bgcnter=ssr+avgvalue; //1.95996*
+
+			score=(double)((cdcnter/(i+1))/bgcnter);
+			bgcnter-=ssr;  //1.95996*
+			bgcnter*=(binNum-i-1);
+			windowsize=(i+1)*(setting->PeakRange/binNum);
+
+			if(score>=bestscore&&cdcnter>maxSeqNum*setting->min_supp_ratio)
+			{
+				bestwindowId=i;		
+				bestscore=score;
+				CDScore=cdcnter;
+				bestbgcnt=bgcnter;
+				bestcdcnt=cdcnter;
+			}
+		
+		}
+		int window=bestwindowId*setting->resolution;
+		cout<<setting->inputFile<<"\t"<<bestscore<<"\t"<<window<<endl;
+}
+int main(int argc, char* argv[])
+{
+
+	PARAM * setting=read_parameters (argc, argv);
+	unsigned long int aa=1;
+	
+	//cout<<sizeof(aa)*8<<endl;
+	if(setting->weightFile!="")
+	{
+		LoadrmPoslist(setting);
+	}
+
+	//SimplePeakEnrichmentScore(setting);
+SmoothCenterDistribtionScore(setting);
+//cin>>aa;
+	return 1;
+	
+	
+}
