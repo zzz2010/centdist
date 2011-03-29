@@ -1,0 +1,2 @@
+Parameters:	file_motif=transfac.motifs	file_fasta=fasfile.fas
+Headers:	MotifName	SeqName	Strand	Len	Start	Score	Sequence
