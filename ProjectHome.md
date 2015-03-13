@@ -1,0 +1,3 @@
+CENTDIST is a novel web-application for identifying co-localized transcription factors around ChIP-seq peaks. Unlike traditional motif scanning program, CENTDIST does not require any user-specific parameters and the background. It automatically learns the best set of parameters for different motif and ranks them based on the skewness of their distribution around ChIP-seq peaks.
+
+http://compbio.ddns.comp.nus.edu.sg/~chipseq/centdist
